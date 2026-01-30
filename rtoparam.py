@@ -237,10 +237,10 @@ def main():
     GAP_NM = 200.0
 
     folders = {
-        0: "/scratch/local/nasadova/data_ml/nn/sshfsmountpoint/Cone/Si/",
-        1: "/scratch/local/nasadova/tmatrix_data_format/jcmsuite/cuboid_si/results",
-        2: "/scratch/local/nasadova/data_ml/data_for_ml/cyl_in_air/new_files/",
-    }
+        0: "cones/",
+        1: "cuboids/",
+        2: "cylinders/",
+    } # MODIFY PATH
 
     WL_MIN_NM = 700.0
     WL_MAX_NM = 1000.0
@@ -473,7 +473,7 @@ def main():
         y_dim=K,
         theta_dim=theta.shape[1],
         width=1024,
-        num_blocks=5,
+        num_blocks=4,
     )
 
     opt_inv = torch.optim.AdamW(inv_model.parameters(), lr=1e-3, weight_decay=1e-4)

@@ -163,10 +163,10 @@ def main():
     GAP_NM   = 200.0
 
     folders = {
-        0: "/scratch/local/nasadova/data_ml/nn/sshfsmountpoint/Cone/Si/",
-        1: "/scratch/local/nasadova/tmatrix_data_format/jcmsuite/cuboid_si/results",
-        2: "/scratch/local/nasadova/data_ml/data_for_ml/cyl_in_air/new_files/",
-    }
+        0: "cones/",
+        1: "cuboids/",
+        2: "cylinders/",
+    } # MODIFY PATH
 
     os.makedirs("figs/", exist_ok=True)
 
@@ -286,7 +286,7 @@ def main():
     Rs = load_or_compute_Rs(title, t_matrices_full, k0s, emb_full, ps, angles, pols, rmax_coef, poltype, lmax)
 
     # ---------------- reference reflectance ----------------
-    reffile = "/scratch/local/nasadova/data_ml/data_for_ml/cyl_in_air/cylinder_si_r_110.0_h_190.0_l_5_wls_7.000000000000001e-07_1.0000000000000002e-06_61_msl_2_3_domain_500_500.tmat.h5"
+    reffile = "cylinder_si_r_110.0_h_190.0_l_5_wls_7.000000000000001e-07_1.0000000000000002e-06_61_msl_2_3_domain_500_500.tmat.h5" #MODIFY PATH
     R_ref, wl_ref = Rvec_from_h5_tr(reffile, angles=angles, GAP_NM=GAP_NM, rmax_coef=rmax_coef)
 
     # ---------------- split ----------------
