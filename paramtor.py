@@ -4,7 +4,7 @@
 # ============================================================
 import os, random
 from glob import glob
-
+from itertools import product
 import h5py
 import numpy as np
 import matplotlib.pyplot as plt
@@ -49,6 +49,7 @@ def save_paper_fig_h5(
     R_true_te,
     R_pred_te,
     R_ref,
+    R_dense_pred, 
     wl_ref,
     angles,
     class_names,
@@ -85,6 +86,7 @@ def save_paper_fig_h5(
         f.create_dataset("R_true_te",  data=R_true_te,  compression="gzip", compression_opts=4)
         f.create_dataset("R_pred_te",  data=R_pred_te,  compression="gzip", compression_opts=4)
         f.create_dataset("R_ref",      data=R_ref,      compression="gzip", compression_opts=4)
+        f.create_dataset("R_dense_pred",      data=R_dense_pred,      compression="gzip", compression_opts=4)
         f.create_dataset("wl_ref",     data=wl_ref,     compression="gzip", compression_opts=4)
 
         f.create_dataset("angles",     data=angles)
@@ -118,15 +120,20 @@ def per_class_mae(model, dataloader, device="cpu"):
     return out
 
 class ResBlock(nn.Module):
-    def __init__(self, dim: int):
+    def __init__(self, dim, dropout=0.0, res_scale=0.1):
         super().__init__()
-        self.fc1 = nn.Linear(dim, dim)
-        self.fc2 = nn.Linear(dim, dim)
+        self.ln = nn.LayerNorm(dim)
+        self.drop = nn.Dropout(dropout)
+        self.res_scale = res_scale
+        self.fc1 = nn.Linear(dim, 2*dim)
+        self.fc2 = nn.Linear(2*dim, dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = F.gelu(self.fc1(x))
+    def forward(self, x):
+        h = self.ln(x)
+        h = F.gelu(self.fc1(h))
+        h = self.drop(h)
         h = self.fc2(h)
-        return x + h
+        return x + self.res_scale * h
 
 class Theta2RResNet(nn.Module):
     def __init__(self, theta_dim: int = 3, y_dim: int = 3,
@@ -278,6 +285,11 @@ def main():
     n_angles = len(angles)
     n_steps = 150
 
+    print("CYLINDERS TOTAL", np.sum(true_labels_full==2))
+    print("CUBOID TOTAL", np.sum(true_labels_full==1))
+    print("CONES TOTAL", np.sum(true_labels_full==0))
+
+
     title = (
         f"angles_pol_{pols[0]}_{pols[1]}_{angles[0]}_{angles[-1]}_{len(angles)}"
         f"_gap_{GAP_NM}_rmax_{rmax_coef}_lmax_{lmax}_min_wls_{min_wls}"
@@ -286,8 +298,8 @@ def main():
     Rs = load_or_compute_Rs(title, t_matrices_full, k0s, emb_full, ps, angles, pols, rmax_coef, poltype, lmax)
 
     # ---------------- reference reflectance ----------------
-    reffile = "cylinder_si_r_110.0_h_190.0_l_5_wls_7.000000000000001e-07_1.0000000000000002e-06_61_msl_2_3_domain_500_500.tmat.h5" #MODIFY PATH
-    R_ref, wl_ref = Rvec_from_h5_tr(reffile, angles=angles, GAP_NM=GAP_NM, rmax_coef=rmax_coef)
+    reffile = "cyl_ref.tmat.h5" #MODIFY PATH
+    R_ref, tm_ref, wl_ref = Rvec_from_h5_tr(reffile, angles=angles, GAP_NM=GAP_NM, rmax_coef=rmax_coef)
 
     # ---------------- split ----------------
     tr_idx, va_idx, te_idx = grouped_train_val_test_stratified(
@@ -297,9 +309,9 @@ def main():
     te_gid = groups[te_idx]
 
     # ---------------- wavelength normalization ----------------
-    mu_lam = wls_full[tr_idx].mean()
-    sd_lam = wls_full[tr_idx].std() + 1e-6
-    lam_n  = (wls_full - mu_lam) / sd_lam
+    lam_mu = wls_full[tr_idx].mean()
+    lam_sd = wls_full[tr_idx].std() + 1e-6
+    lam_n  = (wls_full - lam_mu) / lam_sd
 
     # ---------------- split arrays ----------------
     theta_tr, theta_va, theta_te = theta[tr_idx], theta[va_idx], theta[te_idx]
@@ -437,8 +449,8 @@ def main():
             num_blocks=4,
         ),
         "norm": dict(
-            mu_lam=float(mu_lam),
-            sd_lam=float(sd_lam),
+            lam_mu=float(lam_mu),
+            lam_sd=float(lam_sd),
             mu_th_c={int(k): mu_th_c[k] for k in mu_th_c},
             sd_th_c={int(k): sd_th_c[k] for k in sd_th_c},
             theta_scaled_by_wavelength=False,
@@ -472,7 +484,7 @@ def main():
     R_hat = np.concatenate(preds, axis=0)
     R_true = np.concatenate(trues, axis=0)
 
-    plot_curves(hist, title=title, keys=["loss"], save_path="figs/paramtor_curves")
+    plot_curves(hist, title="Parameters to reflectance", keys=["loss"], save_path="figs/paramtor_curves")
 
 
     # ----------------  figure + H5 ----------------
@@ -489,13 +501,38 @@ def main():
     plot_per_class_mae(hist, split="tr", save_prefix="paramtor_tr")
     plot_per_class_mae(hist, split="va", save_prefix="paramtor_va")
 
+    idx_geom = np.where(te_gid == gid_spec)[0]
+    i0 = idx_geom[0]
+    emb_te = [emb_full[g] for g in te_idx]
+
+    wl_dense = wl_ref
+    lam_dense = ((wl_dense - lam_mu) / lam_sd).astype(np.float64)[:, None]
+    k0_dense = 2*np.pi/wl_dense
+    ps_te = ps[te_idx]
+    ps0  = float(ps_te[i0])          
+    emb0 = emb_te[i0]  
+    th0 = th_te_n[i0] 
+    y0  = int(y_te[i0])             
+    ps_dense  = np.full_like(wl_dense, ps0)
+    emb_dense = [emb0 for _ in range(len(wl_dense))]
+
+    ijk_dense = list(product(range(len(wl_dense)), range(n_angles), range(n_pols)))
+
+    B = len(wl_dense)
+    thB  = torch.from_numpy(np.repeat(th0[None, :], B, axis=0)).float().to(device)
+    lamB = torch.from_numpy(lam_dense).float().to(device)
+    yB   = F.one_hot(torch.full((B,), y0, dtype=torch.long), num_classes=K).float().to(device)
+
+    model.eval()
+    with torch.no_grad():
+        R_dense_pred = model(thB, lamB, yB).cpu().numpy()
 
 
     h5path = f"results/paramtor_results.h5"
     save_paper_fig_h5(
         h5path,
         err_sample, y_te, te_gid, wl_te,
-        R_true, R_hat, R_ref, wl_ref,
+        R_true, R_hat, R_ref, R_dense_pred, wl_ref,
         angles, list(library.values()),
         gid_spec,
         ang_ids=(0, 1, 2),

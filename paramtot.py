@@ -11,7 +11,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader
-
 import treams
 from joblib import Parallel, delayed
 
@@ -180,7 +179,9 @@ def save_results_h5(
     R_true_te, R_pred_te,
     T_true_te, T_pred_te,
     err_T, err_R,
-    R_ref, wl_ref,
+    R_ref,
+    R_ref_pred, 
+    wl_ref,
     class_names=None,
     angles=None, pols=None,
     gid_spec=None, i_T=None
@@ -221,6 +222,7 @@ def save_results_h5(
         d.create_dataset("R_true_te", data=R_true_te, compression="gzip")
         d.create_dataset("R_pred_te", data=R_pred_te, compression="gzip")
         d.create_dataset("R_ref",     data=R_ref, compression="gzip")
+        d.create_dataset("R_ref_pred",     data=R_ref_pred, compression="gzip")
         d.create_dataset("wl_ref",    data=wl_ref, compression="gzip")
 
         d.create_dataset("T_true_te", data=T_true_te, compression="gzip")
@@ -238,8 +240,8 @@ class ResBlock(nn.Module):
     def __init__(self, dim, dropout=0.0, res_scale=0.1):
         super().__init__()
         self.ln = nn.LayerNorm(dim)
-        self.fc1 = nn.Linear(dim, dim * 2)
-        self.fc2 = nn.Linear(dim * 2, dim)
+        self.fc1 = nn.Linear(dim, 2*dim)
+        self.fc2 = nn.Linear(2*dim, dim)
         self.drop = nn.Dropout(dropout)
         self.res_scale = res_scale
 
@@ -557,6 +559,24 @@ lr = 1e-3
 alpha = 0.0
 steps = 150
 
+def project_passive_T(T):
+    """
+    Project T so that S = I + 2T becomes contractive (sigma_max <= 1).
+    T: [B, N, N] complex torch tensor
+    returns: T_proj same shape/type
+    """
+    B, N, _ = T.shape
+    I = torch.eye(N, device=T.device, dtype=T.dtype).expand(B, N, N)
+    S = I + 2*T
+
+    U, s, Vh = torch.linalg.svd(S)      # s: [B, N]
+    s = torch.clamp(s, max=1.0)         # clip singular values to <= 1
+
+    S_proj = (U * s.unsqueeze(-2)) @ Vh
+    T_proj = (S_proj - I) / 2
+    return T_proj
+
+
 model_T = Theta2TResNet(
     theta_dim=th_tr_n.shape[1],
     y_dim=K,
@@ -582,27 +602,21 @@ best_val = float("inf")
 best_state_T = None
 
 n_params = sum(p.numel() for p in model_T.parameters() if p.requires_grad)
-print("Trainable parameters (DoF):", n_params)
-
+print("Trainable parameters:", n_params)
 for ep in range(steps):
     model_T.train()
-    td_sum = tr_sum = tt_sum = n = 0
+    td_sum = tr_sum = tt_sum = tp_sum = n = 0
 
     for thb, lb, yb, Tb in dl_tr_T:
         thb, lb, yb, Tb = thb.to(device), lb.to(device), yb.to(device), Tb.to(device)
         pred = model_T(thb, lb, yb)
-
         loss_data = sym_frob_loss_flat(pred, Tb)
-        
-        loss = loss_data #+ alpha * loss_rec
-
+        loss = loss_data 
         bs = Tb.size(0)
         opt_T.zero_grad()
         loss.backward()
         opt_T.step()
-
         td_sum += loss_data.item() * bs
-        
         tt_sum += loss.item() * bs
         n += bs
 
@@ -617,7 +631,7 @@ for ep in range(steps):
             pred = model_T(thb, lb, yb)
 
             loss_data = sym_frob_loss_flat(pred, Tb)
-            loss = loss_data #+ alpha * loss_rec
+            loss = loss_data 
 
             bs = Tb.size(0)
             vd_sum += loss_data.item() * bs
@@ -631,19 +645,31 @@ for ep in range(steps):
     if val_total < best_val:
         best_val = val_total
         best_state_T = {k: v.detach().cpu().clone() for k, v in model_T.state_dict().items()}
-
     hist["ep"].append(ep)
     hist["train_data"].append(train_data)
     hist["train_total"].append(train_total)
     hist["val_data"].append(val_data)
     hist["val_total"].append(val_total)
-
     if ep % 10 == 0 or ep == 1:
         print(f"[T] ep{ep:03d}  train={train_total:.4e}  val={val_total:.4e}")
 
 model_T.load_state_dict(best_state_T)
 model_T.to(device).eval()
-plot_curves(hist, title=title, keys=["loss"], save_path="figs/paramtot_curves")
+
+import matplotlib as mpl
+
+mpl.rcParams.update({
+    "font.size": 24,
+    "axes.titlesize": 24,
+    "axes.labelsize": 20,
+    "xtick.labelsize": 20,
+    "ytick.labelsize": 20,
+    "legend.fontsize": 20,
+    "lines.linewidth": 2.0,
+    "grid.alpha": 0.3,
+})
+
+plot_curves(hist, title="Parameters to T-matrix", keys=["data"], save_path="figs/paramtot_curves.png")
 
 # ============================================================
 # 9)  param->T on test and T to R 
@@ -677,6 +703,10 @@ T_hat_imag = T_hat_te[:, half:].reshape(B_te, N_modes, N_modes)
 
 T_true_c = T_true_real + 1j * T_true_imag
 T_hat_c = T_hat_real + 1j * T_hat_imag
+
+T_hat_t = torch.from_numpy(T_hat_c).to(device=device)
+with torch.no_grad():
+    T_hat_c = project_passive_T(T_hat_t).cpu().numpy()
 
 num = np.linalg.norm(T_hat_c - T_true_c, axis=(1, 2))
 den = np.linalg.norm(T_true_c, axis=(1, 2)) + 1e-12
@@ -717,7 +747,6 @@ rs_list_pred = Parallel(n_jobs=-1, backend="loky")(
 
 Rs_pred_te_flat = np.array(rs_list_pred)
 Rs_pred_te = Rs_pred_te_flat.reshape(n_te, n_kpar * n_pols)
-print("Rs_pred_te", Rs_pred_te.shape, R_te.shape)
 
 mae_r = np.mean(np.abs(Rs_pred_te - R_te), axis=1)
 rmse = float(np.sqrt(np.mean((Rs_pred_te - R_te) ** 2)))
@@ -732,9 +761,66 @@ print("avg", gid_spec)
 gid_spec = uniq[np.argsort(var_geom)[-1]]
 print("worst", gid_spec)
 
-reffile = "cylinder_si_r_110.0_h_190.0_l_5_wls_7.000000000000001e-07_1.0000000000000002e-06_61_msl_2_3_domain_500_500.tmat.h5" #MODIFY PATH
+reffile = "cyl_ref.tmat.h5" #MODIFY PATH
 
-R_ref, wl_ref = Rvec_from_h5_tr(reffile, angles=angles, GAP_NM=GAP_NM, rmax_coef=rmax_coef)
+R_ref, t_ref,  wl_ref = Rvec_from_h5_tr(reffile, angles=angles, GAP_NM=GAP_NM, rmax_coef=rmax_coef)
+
+# ============================================================
+# ADDING PREDICTIONS AT MANY WAVELENGTHS
+# ============================================================
+
+idx_geom = np.where(te_gid == gid_spec)[0]
+i0 = idx_geom[0]                    
+
+th0 = th_te_n[i0]                    
+y0  = int(y_te[i0])                  
+
+wl_dense = wl_ref
+lam_dense = ((wl_dense - lam_mu) / lam_sd).astype(np.float64)[:, None]
+k0_dense = 2*np.pi/wl_dense
+ps0  = float(ps_te[i0])          
+emb0 = emb_te[i0]                
+ps_dense  = np.full_like(wl_dense, ps0)
+emb_dense = [emb0 for _ in range(len(wl_dense))]
+
+ijk_dense = list(product(range(len(wl_dense)), range(n_kpar), range(n_pols)))
+
+B = len(wl_dense)
+thB  = torch.from_numpy(np.repeat(th0[None, :], B, axis=0)).float().to(device)
+lamB = torch.from_numpy(lam_dense).float().to(device)
+yB   = F.one_hot(torch.full((B,), y0, dtype=torch.long), num_classes=K).float().to(device)
+
+model_T.eval()
+with torch.no_grad():
+    T_hat_dense_flat = model_T(thB, lamB, yB).cpu().numpy()
+
+half = T_hat_dense_flat.shape[1] // 2
+T_hat_dense = (T_hat_dense_flat[:, :half] + 1j*T_hat_dense_flat[:, half:]).reshape(
+    B, N_modes, N_modes
+)
+
+T_hat_dense_t = torch.from_numpy(T_hat_dense).to(device=device)
+with torch.no_grad():
+    T_hat_dense = project_passive_T(T_hat_dense_t).cpu().numpy()
+
+rs_list_pred_dense = Parallel(n_jobs=-1, backend="loky")(
+    delayed(create_r)(
+        i, j, p,
+        T_hat_dense,
+        k0_dense,
+        emb_dense,
+        ps_dense,
+        angles,
+        pols,
+        rmax_coef,
+        poltype,
+        lmax=lmax,
+    )
+    for (i, j, p) in ijk_dense
+)
+
+R_pred_dense_flat = np.array(rs_list_pred_dense)
+R_pred_dense = R_pred_dense_flat.reshape(len(wl_dense), n_kpar * n_pols)
 
 eps = 1e-12
 diff = T_hat_c - T_true_c
@@ -753,7 +839,7 @@ print("max|T_true|", float(np.abs(Tt).max()), "median|T_true|", float(np.median(
 print("max|T_pred|", float(np.abs(Tp).max()), "median|T_pred|", float(np.median(np.abs(Tp))))
 print("median|pred-true|", float(np.median(np.abs(Tp - Tt))))
 print("grid spec", gid_spec)
-filename = "results/paramtot_results.h5"
+filename = "results/paramtot_results_passive.h5"
 save_results_h5(
     filename,
     y_te=y_te,
@@ -766,6 +852,7 @@ save_results_h5(
     err_T=err_T,
     err_R=mae_r,
     R_ref=R_ref,
+    R_ref_pred=R_pred_dense,
     wl_ref=wl_ref,
     angles=angles,
     pols=pols,
