@@ -1,0 +1,15 @@
+name: tdat_ml
+channels:
+  - pytorch
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - h5py
+  - matplotlib
+  - joblib
+  - scikit-learn
+  - pip
+  - pip:
+      - treams
+  - pytorch
